@@ -1,0 +1,10 @@
+# Personal files - never commit these
+config.toml
+.lunchmoney-token
+dedupe-history.jsonl
+dedupe-ignored.json
+
+__pycache__/
+*.pyc
+.venv/
+*.zip

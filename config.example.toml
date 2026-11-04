@@ -1,0 +1,32 @@
+# Lunch Money Dedupe - example configuration
+# ---------------------------------------------------------------
+# You don't need a config file: these are the defaults.
+# To change something, copy this file to config.toml and edit it.
+
+# How many days back to look for duplicates.
+lookback_days = 60
+
+# The bank copy may show up this many days after the day you entered it...
+days_after = 10
+# ...or this many days before it.
+days_before = 3
+
+# Amounts must match exactly unless you allow a difference, for example
+# for restaurant tips or gas-station pre-authorizations.
+amount_tolerance = 0.00          # a fixed difference, e.g. 2.00
+amount_tolerance_percent = 0.0   # or a percentage, e.g. 25 for tips
+
+# Where bank copies come from. Run  python dedupe.py sources  to see the
+# sources in your own budget. Everything not listed here counts as entered
+# by you (in the Lunch Money app, through the API, by another tool).
+imported_sources = ["plaid", "csv"]
+
+# Several of your entries (for example one per category from a receipt)
+# can add up to one bank charge. This is the most entries checked together.
+max_group_parts = 6
+
+# Whose payee name to keep when merging: "entered" (yours) or "imported" (the bank's).
+keep_payee = "entered"
+
+# auto --apply only merges single pairs that score at least this much (out of 100).
+auto_min_score = 90
