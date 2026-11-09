@@ -30,3 +30,9 @@ keep_payee = "entered"
 
 # auto --apply only merges single pairs that score at least this much (out of 100).
 auto_min_score = 90
+
+# Also look for the same bank charge imported twice (for example after
+# reconnecting a bank). review and scan show these; auto never touches them.
+find_double_imports = true
+# How many days apart the two copies' dates can be.
+double_import_days = 1

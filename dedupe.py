@@ -48,7 +48,7 @@ except ImportError:
     sys.exit("The 'requests' package is missing. Install it with:\n"
              "    python -m pip install requests")
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 API_BASE = "https://api.lunchmoney.dev/v2"
 MAX_PAGES = 50
@@ -77,6 +77,10 @@ DEFAULTS = {
     "keep_payee": "entered",
     # Pairs scoring at least this much are merged by `auto --apply`.
     "auto_min_score": 90,
+    # Also look for the same bank charge imported twice (for example after reconnecting
+    # a bank), and how many days apart the two copies' dates can be.
+    "find_double_imports": True,
+    "double_import_days": 1,
 }
 
 PAYEE_NOISE = {"inc", "ltd", "llc", "the", "store", "stores", "pos", "purchase", "payment",
@@ -289,7 +293,8 @@ def load_config(path: Path) -> dict:
     if cfg["keep_payee"] not in ("entered", "imported"):
         raise ConfigError('keep_payee must be "entered" or "imported"')
     cfg["imported_sources"] = [str(s).lower() for s in cfg["imported_sources"]]
-    for key in ("days_after", "days_before", "max_group_parts", "lookback_days"):
+    for key in ("days_after", "days_before", "max_group_parts", "lookback_days",
+                "double_import_days"):
         if not isinstance(cfg[key], int) or cfg[key] < 0:
             raise ConfigError(f"{key} must be a whole number of 0 or more")
     return cfg
@@ -373,6 +378,8 @@ def payee_words(text: str) -> list[str]:
 
 def payee_similarity(a: str, b: str) -> float:
     """0..1. 'Esso gas' vs 'ESSO 1234 TORONTO ON' scores high; unrelated names score low."""
+    if (a or "").strip() and (a or "").strip().lower() == (b or "").strip().lower():
+        return 1.0
     wa, wb = payee_words(a), payee_words(b)
     if not wa or not wb:
         return 0.0
@@ -412,6 +419,14 @@ class Match:
     entered: list[dict]
     score: int
     reasons: list[str] = field(default_factory=list)
+    # "entry": your entry + its bank copy (imported = bank copy, entered = your entries)
+    # "double": the same charge imported twice (imported = older copy, kept;
+    #           entered = [newer copy])
+    kind: str = "entry"
+
+    @property
+    def is_double(self) -> bool:
+        return self.kind == "double"
 
     @property
     def is_group(self) -> bool:
@@ -419,6 +434,8 @@ class Match:
 
     @property
     def label(self) -> str:
+        if self.is_double:
+            return "likely double import" if self.score >= 90 else "possible double import"
         if self.score >= 90:
             return "exact match"
         return "likely match" if self.score >= 70 else "possible match"
@@ -494,13 +511,122 @@ def find_matches(transactions: list[dict], cfg: dict,
     return chosen
 
 
+def created(t: dict) -> str:
+    return str(t.get("created_at") or "")
+
+
+def older_first(a: dict, b: dict) -> tuple[dict, dict]:
+    """The copy that was imported first (it usually has your edits), then the other."""
+    ka, kb = (created(a), a["id"]), (created(b), b["id"])
+    return (a, b) if ka <= kb else (b, a)
+
+
+def bank_name(t: dict) -> str:
+    return t.get("original_name") or t.get("payee") or ""
+
+
+def hours_between(a: str, b: str) -> float | None:
+    try:
+        ta, tb = (dt.datetime.fromisoformat(x.replace("Z", "+00:00")) for x in (a, b))
+    except ValueError:
+        return None
+    return abs((ta - tb).total_seconds()) / 3600
+
+
+def same_bank_id(a: dict, b: dict) -> bool:
+    return bool(a.get("external_id")) and a.get("external_id") == b.get("external_id")
+
+
+def same_name(a: dict, b: dict) -> bool:
+    """The bank's own description, exactly (reference numbers and tickers included)."""
+    na, nb = (" ".join(bank_name(t).lower().split()) for t in (a, b))
+    return bool(na) and na == nb
+
+
+def score_double(old: dict, new: dict) -> tuple[int, list[str]] | None:
+    """None when the pair doesn't look like a double import at all."""
+    if same_bank_id(old, new):
+        return 100, ["same bank ID"]
+    if not same_name(old, new):
+        return None
+    hours = hours_between(created(old), created(new))
+    if hours is not None and hours < 24:
+        # Imported in the same sync: that's two real charges, not a repeat import.
+        return None
+    score, reasons = 100, []
+    gap = abs((day(new) - day(old)).days)
+    if gap:
+        score -= 15 * gap
+        reasons.append(f"{gap} day{'s' if gap != 1 else ''} apart")
+    if hours is None:
+        score -= 30
+        reasons.append("couldn't tell when each copy was imported")
+    else:
+        reasons.append(f"second copy imported {int(hours // 24)} days later")
+    return max(score, 0), reasons
+
+
+def find_double_imports(transactions: list[dict], cfg: dict, ignored: set[str] | None = None,
+                        used: set | None = None) -> list[Match]:
+    """The same bank charge imported twice: same account, amount and bank description,
+    dates close, and the second copy brought in by a later sync (e.g. after a reconnect)."""
+    ignored, used = ignored or set(), used or set()
+    pool = [t for t in transactions if is_imported(t, cfg) and not skip(t)
+            and money(t) != 0 and account_key(t) is not None and t["id"] not in used]
+    groups: dict = {}
+    for t in pool:
+        groups.setdefault((account_key(t), money(t), str(t.get("currency") or "").lower()),
+                          []).append(t)
+    candidates = []
+    for items in groups.values():
+        for a, b in itertools.combinations(items, 2):
+            if abs((day(a) - day(b)).days) > cfg["double_import_days"]:
+                continue
+            old, new = older_first(a, b)
+            scored = score_double(old, new)
+            if scored:
+                candidates.append(Match(old, [new], *scored, kind="double"))
+    candidates.sort(key=lambda m: (-m.score, day(m.imported)))
+    taken: set = set()
+    chosen = []
+    for m in candidates:
+        ids = {m.imported["id"], m.entered[0]["id"]}
+        if ids & taken or pair_key(m.imported, m.entered) in ignored:
+            continue
+        taken |= ids
+        chosen.append(m)
+    return chosen
+
+
+def find_all(transactions: list[dict], cfg: dict, ignored: set[str] | None = None) -> list[Match]:
+    """Your entries with their bank copies, then charges imported twice."""
+    matches = find_matches(transactions, cfg, ignored)
+    if cfg["find_double_imports"]:
+        used = {i for m in matches for i in (m.imported["id"], *(t["id"] for t in m.entered))}
+        matches += find_double_imports(transactions, cfg, ignored, used)
+    return matches
+
+
 # --------------------------------------------------------------------------
 # Actions
 # --------------------------------------------------------------------------
 def merged_changes(m: Match, cfg: dict) -> dict:
-    """What the bank copy gets from your entry when a single pair is merged."""
+    """What the bank copy gets from your entry when a single pair is merged.
+
+    For a double import, the older copy only gets what it's missing from the newer one.
+    """
     e, imp = m.entered[0], m.imported
     changes: dict = {}
+    if m.is_double:
+        if e.get("category_id") and not imp.get("category_id"):
+            changes["category_id"] = e["category_id"]
+        mine, theirs = (e.get("notes") or "").strip(), (imp.get("notes") or "").strip()
+        if mine and mine not in theirs:
+            changes["notes"] = f"{theirs} | {mine}" if theirs else mine
+        tags = list(dict.fromkeys([*tag_ids(imp), *tag_ids(e)]))
+        if tags != tag_ids(imp):
+            changes["tag_ids"] = tags
+        return changes
     if e.get("category_id") and e.get("category_id") != imp.get("category_id"):
         changes["category_id"] = e["category_id"]
     if cfg["keep_payee"] == "entered" and e.get("payee") and e["payee"] != imp.get("payee"):
@@ -541,7 +667,10 @@ def do_merge(lm: LunchMoney, m: Match, cfg: dict) -> str:
         changes = merged_changes(m, cfg)
         if changes:
             lm.update(m.imported["id"], changes)
-        done = "updated the bank copy" if changes else "bank copy already had your details"
+        if m.is_double:
+            done = "updated the older copy" if changes else "older copy already had everything"
+        else:
+            done = "updated the bank copy" if changes else "bank copy already had your details"
     failed = []
     for e in m.entered:
         try:
@@ -549,8 +678,11 @@ def do_merge(lm: LunchMoney, m: Match, cfg: dict) -> str:
         except ApiError as err:
             failed.append(f"{e['id']} ({err})")
     if failed:
-        return (f"{done}, but couldn't delete your entry: {', '.join(failed)}. "
+        what = "the newer copy" if m.is_double else "your entry"
+        return (f"{done}, but couldn't delete {what}: {', '.join(failed)}. "
                 "Delete it in Lunch Money by hand.")
+    if m.is_double:
+        return f"{done} and deleted the newer copy"
     return f"{done} and deleted your entr{'ies' if m.is_group else 'y'}"
 
 
@@ -559,6 +691,8 @@ def do_delete(lm: LunchMoney, m: Match, which: str) -> str:
     record(f"delete_{which}", m)
     for t in targets:
         lm.delete(t["id"])
+    if m.is_double:
+        return "deleted the older copy" if which == "imported" else "deleted the newer copy"
     return "deleted the bank copy" if which == "imported" else \
         f"deleted your entr{'ies' if m.is_group else 'y'}"
 
@@ -597,6 +731,28 @@ def show_match(m: Match, names: Names, n: int, total: int, cfg: dict) -> None:
         return
     e = m.entered[0]
     gap = (day(imp) - day(e)).days
+    if m.is_double:
+        rows = [
+            ("Date", imp["date"], e["date"]),
+            ("Amount", money(imp), money(e)),
+            ("Payee", imp.get("payee"), e.get("payee")),
+            ("Bank name", imp.get("original_name"), e.get("original_name")),
+            ("Account", imp.get("_account"), e.get("_account")),
+            ("Category", names.category(imp.get("category_id")),
+             names.category(e.get("category_id"))),
+            ("Notes", imp.get("notes"), e.get("notes")),
+            ("Tags", names.tag_list(tag_ids(imp)), names.tag_list(tag_ids(e))),
+            ("Imported", created(imp)[:10], created(e)[:10]),
+        ]
+        print(f"  {'':10} {'OLDER COPY (kept)':34} NEWER COPY")
+        for label, a, b in rows:
+            if a in (None, "") and b in (None, ""):
+                continue
+            print(f"  {label:10} {cut(a, 34):34} {cut(b, 40)}")
+        if attachments(e):
+            print(f"  ! The newer copy has {attachments(e)} attached file(s). Merging can't move "
+                  "them; choose [w] to keep the newer copy instead.")
+        return
     rows = [
         ("Date", e["date"], f"{imp['date']}" + (f"  ({gap:+d} days)" if gap else "")),
         ("Amount", money(e), money(imp)),
@@ -623,6 +779,12 @@ def preview_merge(m: Match, names: Names, cfg: dict) -> str:
                           for p in split_parts(m, cfg))
         return f"would split the bank charge into: {parts}; then delete your entries"
     changes = merged_changes(m, cfg)
+    if m.is_double:
+        what = ", ".join(f"{k.replace('_id', '').replace('_ids', '')} = "
+                         f"{names.category(v) if k == 'category_id' else names.tag_list(v) if k == 'tag_ids' else v!r}"
+                         for k, v in changes.items())
+        return (f"would set on the older copy: {what}; then delete the newer copy" if what
+                else "would delete the newer copy (the older one already has everything)")
     shown = {k: (names.category(v) if k == "category_id" else
                  names.tag_list(v) if k == "tag_ids" else v) for k, v in changes.items()}
     what = ", ".join(f"{k.replace('_id', '').replace('_ids', '')} = {v!r}"
@@ -646,6 +808,10 @@ def ask_choice(prompt: str, options: list[str], default: str) -> str:
         print(f"  Please type one of: {', '.join(options)}")
 
 
+DOUBLE_MENU = """  [m] merge: keep the older copy, adding anything only the newer one has; delete the newer
+  [o] keep the older copy, delete the newer [w] keep the newer copy, delete the older
+  [n] not a duplicate (don't show again)    [s] skip for now      [q] quit"""
+
 REVIEW_MENU = """  [m] merge: keep the bank copy with your category, payee, notes and tags; delete yours
   [e] keep yours, delete the bank copy      [b] keep the bank copy, delete yours
   [n] not a duplicate (don't show again)    [s] skip for now      [q] quit"""
@@ -657,7 +823,7 @@ def cmd_review(args, cfg: dict) -> int:
     print(f"Looking for duplicates in the last {days} days…")
     names = Names(lm.categories(), safe_tags(lm))
     ignored = load_ignored()
-    matches = find_matches(fetch(lm, days), cfg, ignored)
+    matches = find_all(fetch(lm, days), cfg, ignored)
     if not matches:
         print("No duplicates found.")
         return 0
@@ -666,9 +832,15 @@ def cmd_review(args, cfg: dict) -> int:
     counts = Counter()
     for n, m in enumerate(matches, 1):
         show_match(m, names, n, len(matches), cfg)
-        print(REVIEW_MENU)
-        default = "s" if attachments(m.entered[0]) else "m"
-        choice = ask_choice("Choose", ["m", "e", "b", "n", "s", "q"], default)
+        if m.is_double:
+            print(DOUBLE_MENU)
+            default = "m" if m.score >= 90 and not attachments(m.entered[0]) else "s"
+            choice = ask_choice("Choose", ["m", "o", "w", "n", "s", "q"], default)
+            choice = {"o": "b", "w": "e"}.get(choice, choice)   # same actions as below
+        else:
+            print(REVIEW_MENU)
+            default = "s" if attachments(m.entered[0]) else "m"
+            choice = ask_choice("Choose", ["m", "e", "b", "n", "s", "q"], default)
         if choice == "q":
             break
         if choice == "s":
@@ -682,9 +854,12 @@ def cmd_review(args, cfg: dict) -> int:
             print("  OK, won't show this pair again.")
             continue
         if args.dry_run:
-            print("  (dry run) " + (preview_merge(m, names, cfg) if choice == "m" else
-                                    "would delete the bank copy" if choice == "e" else
-                                    "would delete your entry"))
+            if m.is_double:
+                what = ("would delete the older copy" if choice == "e" else
+                        "would delete the newer copy")
+            else:
+                what = "would delete the bank copy" if choice == "e" else "would delete your entry"
+            print("  (dry run) " + (preview_merge(m, names, cfg) if choice == "m" else what))
             continue
         try:
             if choice == "m":
@@ -707,7 +882,7 @@ def cmd_scan(args, cfg: dict) -> int:
     lm = get_client(interactive=False)
     days = args.days or cfg["lookback_days"]
     names = Names(lm.categories(), safe_tags(lm))
-    matches = find_matches(fetch(lm, days), cfg, load_ignored())
+    matches = find_all(fetch(lm, days), cfg, load_ignored())
     for n, m in enumerate(matches, 1):
         show_match(m, names, n, len(matches), cfg)
         print("  -> " + preview_merge(m, names, cfg))

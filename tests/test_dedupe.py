@@ -29,7 +29,8 @@ def tx(amount, date, payee, source="manual", account=7, **extra):
 
 
 def bank(amount, date, payee, **extra):
-    return tx(amount, date, payee, source="plaid", external_id="abc", **extra)
+    extra.setdefault("external_id", f"x{next(_next)}")
+    return tx(amount, date, payee, source="plaid", **extra)
 
 
 class FakeLM:
@@ -233,12 +234,111 @@ class TestReview(unittest.TestCase):
         self.assertEqual(lm.calls, [])
         self.assertEqual(len(json.loads(ign.read_text())), 1)
 
+    def double_pair(self):
+        return [imp("5.00", "2026-10-01", "TIM HORTONS", "2026-10-02T00:00:00Z", category_id=3),
+                imp("5.00", "2026-10-01", "TIM HORTONS", "2026-10-20T00:00:00Z")]
+
+    def test_double_keep_older_deletes_newer(self):
+        txs = self.double_pair()
+        lm, out, _, _ = self.run_review(["o"], txs)
+        self.assertEqual(lm.calls, [("delete", txs[1]["id"])])
+        self.assertIn("OLDER COPY", out)
+
+    def test_double_keep_newer_deletes_older(self):
+        txs = self.double_pair()
+        lm, _, _, _ = self.run_review(["w"], txs)
+        self.assertEqual(lm.calls, [("delete", txs[0]["id"])])
+
+    def test_double_merge_default(self):
+        txs = self.double_pair()
+        lm, out, _, _ = self.run_review([""], txs)
+        self.assertEqual(lm.calls, [("delete", txs[1]["id"])])
+        self.assertIn("deleted the newer copy", out)
+
     def test_attachment_defaults_to_skip(self):
         txs = self.pair()
         txs[0]["files"] = [{"id": 1}]
         lm, out, _, _ = self.run_review([""], txs)
         self.assertEqual(lm.calls, [])
         self.assertIn("attached file", out)
+
+
+def imp(amount, date, name, created, **extra):
+    return bank(amount, date, name, original_name=name, created_at=created, **extra)
+
+
+class TestDoubleImports(unittest.TestCase):
+    def test_reconnect_copy_found_and_older_kept(self):
+        old = imp("12.50", "2026-10-01", "TIM HORTONS #123", "2026-10-02T10:00:00Z", category_id=4)
+        new = imp("12.50", "2026-10-01", "TIM HORTONS #123", "2026-10-20T08:00:00Z")
+        [m] = d.find_all([new, old], CFG)
+        self.assertTrue(m.is_double)
+        self.assertEqual((m.imported["id"], m.entered[0]["id"]), (old["id"], new["id"]))
+        self.assertGreaterEqual(m.score, 90)
+
+    def test_same_sync_is_two_real_charges(self):
+        a = imp("2.00", "2026-10-01", "TTC FARE", "2026-10-02T10:00:00Z")
+        b = imp("2.00", "2026-10-01", "TTC FARE", "2026-10-02T10:00:05Z")
+        self.assertEqual(d.find_all([a, b], CFG), [])
+
+    def test_bank_description_must_match_exactly(self):
+        pairs = [("QCN - Dividend", "QUU - Dividend"),
+                 ("E-TRANSFER 011649334031 ERINY", "E-TRANSFER 011577801214 ERINY")]
+        for x, y in pairs:
+            a = imp("0.01", "2026-10-01", x, "2026-10-02T00:00:00Z")
+            b = imp("0.01", "2026-10-01", y, "2026-10-20T00:00:00Z")
+            self.assertEqual(d.find_all([a, b], CFG), [], x)
+
+    def test_unknown_import_time_is_only_possible(self):
+        a = imp("5", "2026-10-01", "NETFLIX", "")
+        b = imp("5", "2026-10-01", "NETFLIX", "")
+        [m] = d.find_all([a, b], CFG)
+        self.assertEqual(m.label, "possible double import")
+
+    def test_same_bank_id_is_certain(self):
+        a = imp("5", "2026-10-01", "A", "2026-10-02T10:00:00Z")
+        b = imp("5", "2026-10-01", "A", "2026-10-02T10:00:01Z")
+        b["external_id"] = a["external_id"]
+        [m] = d.find_all([a, b], CFG)
+        self.assertEqual(m.score, 100)
+
+    def test_not_matched_across_accounts_payees_or_dates(self):
+        base = imp("9.99", "2026-10-01", "NETFLIX", "2026-10-02T00:00:00Z", account=1)
+        others = [imp("9.99", "2026-10-01", "NETFLIX", "2026-10-20T00:00:00Z", account=2),
+                  imp("9.99", "2026-10-01", "SPOTIFY", "2026-10-20T00:00:00Z", account=1),
+                  imp("9.99", "2026-10-05", "NETFLIX", "2026-10-20T00:00:00Z", account=1)]
+        for o in others:
+            self.assertEqual(d.find_all([base, o], CFG), [], o["original_name"])
+
+    def test_can_be_turned_off(self):
+        a = imp("5", "2026-10-01", "A", "2026-10-02T00:00:00Z")
+        b = imp("5", "2026-10-01", "A", "2026-10-20T00:00:00Z")
+        self.assertEqual(d.find_all([a, b], {**CFG, "find_double_imports": False}), [])
+
+    def test_entry_match_takes_priority(self):
+        mine = tx("5", "2026-10-01", "A")
+        a = imp("5", "2026-10-01", "A", "2026-10-02T00:00:00Z")
+        b = imp("5", "2026-10-01", "A", "2026-10-20T00:00:00Z")
+        ms = d.find_all([mine, a, b], CFG)
+        self.assertEqual([m.kind for m in ms], ["entry"])
+
+    def test_merge_only_fills_gaps(self):
+        old = imp("5", "2026-10-01", "A", "2026-10-02T00:00:00Z", category_id=4, notes="mine")
+        new = imp("5", "2026-10-01", "A", "2026-10-20T00:00:00Z", category_id=7, notes="new",
+                  tag_ids=[3])
+        m = d.Match(old, [new], 95, kind="double")
+        self.assertEqual(d.merged_changes(m, CFG), {"notes": "mine | new", "tag_ids": [3]})
+
+    def test_auto_never_touches_double_imports(self):
+        a = imp("5", "2026-10-01", "A", "2026-10-02T00:00:00Z")
+        b = imp("5", "2026-10-01", "A", "2026-10-20T00:00:00Z")
+        lm = FakeLM()
+        lm.categories, lm.tags = (lambda: {}), (lambda: {})
+        lm.transactions = lambda start, end: [a, b]
+        with mock.patch.object(d, "get_client", return_value=lm), \
+             mock.patch.object(d, "load_ignored", lambda: set()), redirect_stdout(io.StringIO()):
+            d.cmd_auto(mock.Mock(days=None, apply=True), CFG)
+        self.assertEqual(lm.calls, [])
 
 
 class TestNearMisses(unittest.TestCase):

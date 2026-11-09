@@ -24,6 +24,7 @@ Lunch Money can't link a manual transaction to the synced one yet, so entering a
 - Also finds **several entries that add up to one charge**, for example a receipt you entered as one transaction per category. Merging splits the bank charge into those categories.
 - **Merge** keeps the bank copy, so your balances still reconcile with the bank, and copies your category, payee, notes and tags onto it. Then it deletes your entry.
 - Or keep either copy and delete the other, or mark a pair as "not a duplicate" so it's never shown again.
+- Also finds **the same bank charge imported twice**, for example after reconnecting a bank. See [Charges imported twice](#charges-imported-twice).
 
 **Safe by default:** `scan` and `review --dry-run` change nothing, pending bank charges and split or grouped transactions are left alone, every change is saved with a full copy of both transactions in `dedupe-history.jsonl`, and your access token stays on your own computer.
 
@@ -80,6 +81,27 @@ Press Enter to accept the suggested choice (merge), or type a letter.
 Add `--days 90` to any command to look further back (the default is 60 days).
 
 `auto` only merges single pairs that score 90 or more out of 100, and never touches receipt-style groups or entries with attached files. Everything else is left for `review`. You can run `auto --apply` on a schedule (Task Scheduler on Windows, cron on Mac/Linux) once you trust what it finds.
+
+## Charges imported twice
+
+Reconnecting a bank can bring in a second copy of transactions that were already there. `review` and `scan` also look for these: two bank transactions on the same account with the same amount and exactly the same bank description, dated at most a day apart, where the second copy came in with a later sync.
+
+```
+[1/1]  likely double import (score 100) - second copy imported 18 days later
+             OLDER COPY (kept)                  NEWER COPY
+  Date       2026-10-01                         2026-10-01
+  Amount     5.00                               5.00
+  Payee      TIM HORTONS #1234                  TIM HORTONS #1234
+  Category   Coffee                             (none)
+  Imported   2026-10-02                         2026-10-20
+  [m] merge: keep the older copy, adding anything only the newer one has; delete the newer
+  [o] keep the older copy, delete the newer [w] keep the newer copy, delete the older
+  [n] not a duplicate (don't show again)    [s] skip for now      [q] quit
+```
+
+- **Merge** keeps the older copy, because that's the one you've usually categorized, and adds anything only the newer copy has (a category if the older one has none, notes, tags). Then it deletes the newer copy.
+- Two copies imported **in the same sync** are never flagged. Those are real separate charges, like two transfers of the same amount on the same day, or two dividends on the same date. The bank description has to match exactly, so e-transfers with different reference numbers are kept apart too.
+- `auto` never touches these pairs. To stop looking for them, set `find_double_imports = false` in `config.toml`.
 
 ## Settings
 
