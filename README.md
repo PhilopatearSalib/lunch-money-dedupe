@@ -75,6 +75,7 @@ Press Enter to accept the suggested choice (merge), or type a letter.
 | `python dedupe.py auto` | Preview merging the clear single pairs without asking |
 | `python dedupe.py auto --apply` | Merge them |
 | `python dedupe.py sources` | Show where your recent transactions came from |
+| `python dedupe.py explain` | Show why your entries weren't matched to a bank copy |
 
 Add `--days 90` to any command to look further back (the default is 60 days).
 

@@ -12,6 +12,7 @@ Quick start:
     python dedupe.py auto              preview automatic merging of exact matches
     python dedupe.py auto --apply      merge exact matches without asking
     python dedupe.py sources           show where your recent transactions came from
+    python dedupe.py explain           show why your entries weren't matched
 
 https://github.com/PhilopatearSalib/lunch-money-dedupe
 """
@@ -47,7 +48,7 @@ except ImportError:
     sys.exit("The 'requests' package is missing. Install it with:\n"
              "    python -m pip install requests")
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 API_BASE = "https://api.lunchmoney.dev/v2"
 MAX_PAGES = 50
@@ -744,6 +745,71 @@ def cmd_auto(args, cfg: dict) -> int:
     return 1 if failed else 0
 
 
+def near_misses(transactions: list[dict], cfg: dict, window: int = 31) -> list[tuple]:
+    """Your entries that have a bank transaction with the same amount nearby, but
+    weren't matched, with the reasons why."""
+    entered = [t for t in transactions if not is_imported(t, cfg) and not skip(t)
+               and money(t) != 0]
+    imported = [t for t in transactions if is_imported(t, cfg)]
+    out = []
+    for e in entered:
+        for imp in imported:
+            if abs(money(imp)) != abs(money(e)) or abs((day(imp) - day(e)).days) > window:
+                continue
+            why = []
+            if imp.get("is_pending"):
+                why.append("bank copy is still pending")
+            if imp.get("split_parent_id") or imp.get("is_split_parent"):
+                why.append("bank copy is split")
+            if imp.get("group_parent_id") or imp.get("is_group_parent"):
+                why.append("bank copy is in a group")
+            if (money(e) > 0) != (money(imp) > 0):
+                why.append("one is a charge, the other a refund")
+            if not same_currency(e, imp):
+                why.append(f"currency {e.get('currency')} vs {imp.get('currency')}")
+            if not account_ok(e, imp):
+                why.append(f"different account ({e.get('_account') or '?'} vs "
+                           f"{imp.get('_account') or '?'})")
+            if not date_ok(e, imp, cfg):
+                why.append(f"{(day(imp) - day(e)).days:+d} days apart "
+                           f"(allowed -{cfg['days_before']} to +{cfg['days_after']})")
+            if why:
+                out.append((e, imp, why))
+    return out
+
+
+def cmd_explain(args, cfg: dict) -> int:
+    """Why entries weren't matched: where they live and the closest bank transactions."""
+    lm = get_client(interactive=False)
+    days = args.days or cfg["lookback_days"]
+    txs = fetch(lm, days)
+    matches = find_matches(txs, cfg, load_ignored())
+    entered = [t for t in txs if not is_imported(t, cfg) and not skip(t)]
+    print(f"{len(txs)} transactions in the last {days} days; {len(entered)} entered by you; "
+          f"{len(matches)} matched as duplicates.\n")
+    print("Your entries by account:")
+    for name, n in Counter(t.get("_account") or "(no account)" for t in entered).most_common():
+        print(f"  {n:5}  {name}")
+    print("Bank copies by account:")
+    for name, n in Counter(t.get("_account") or "(no account)" for t in txs
+                           if is_imported(t, cfg)).most_common():
+        print(f"  {n:5}  {name}")
+    misses = near_misses(txs, cfg)
+    print(f"\nEntries with a same-amount bank transaction within a month that didn't match "
+          f"({len(misses)}):")
+    for e, imp, why in misses[: args.limit]:
+        print(f"  YOURS {e['date']} {money(e):>9}  {cut(e.get('payee'), 24):24} "
+              f"[{cut(e.get('_account') or 'no account', 18)}]")
+        print(f"  BANK  {imp['date']} {money(imp):>9}  {cut(imp.get('payee'), 24):24} "
+              f"[{cut(imp.get('_account'), 18)}]")
+        print(f"        -> {'; '.join(why)}")
+    if len(misses) > args.limit:
+        print(f"  … and {len(misses) - args.limit} more (use --limit)")
+    if not misses:
+        print("  none - your entries don't have bank transactions with the same amount nearby.")
+    return 0
+
+
 def cmd_sources(args, cfg: dict) -> int:
     lm = get_client(interactive=False)
     days = args.days or cfg["lookback_days"]
@@ -791,11 +857,14 @@ def main(argv: list[str] | None = None) -> int:
     a = sub.add_parser("auto", parents=[common], help="merge exact matches (preview unless --apply)")
     a.add_argument("--apply", action="store_true", help="actually merge them")
     sub.add_parser("sources", parents=[common], help="show where recent transactions came from")
+    ex = sub.add_parser("explain", parents=[common], help="show why entries weren't matched")
+    ex.add_argument("--limit", type=int, default=25, help="how many near misses to show")
     args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
         return 0
-    handlers = {"review": cmd_review, "scan": cmd_scan, "auto": cmd_auto, "sources": cmd_sources}
+    handlers = {"review": cmd_review, "scan": cmd_scan, "auto": cmd_auto, "sources": cmd_sources,
+                "explain": cmd_explain}
     try:
         cfg = load_config(Path(args.config))
         return handlers[args.command](args, cfg) or 0

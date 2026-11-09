@@ -198,7 +198,7 @@ class TestReview(unittest.TestCase):
         lm.transactions = lambda start, end: txs
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        hist, ign = Path(tmp.name) / "h.jsonl", Path(tmp.name) / "i.json"
+        ign = Path(tmp.name) / "i.json"
         args = mock.Mock(days=None, dry_run=dry_run)
         out = io.StringIO()
         with mock.patch.object(d, "get_client", return_value=lm), \
@@ -239,6 +239,24 @@ class TestReview(unittest.TestCase):
         lm, out, _, _ = self.run_review([""], txs)
         self.assertEqual(lm.calls, [])
         self.assertIn("attached file", out)
+
+
+class TestNearMisses(unittest.TestCase):
+    def test_reports_account_and_date_reasons(self):
+        mine = tx("10", "2026-10-01", "A", account=1)
+        theirs = bank("10", "2026-10-20", "A", account=2)
+        [(e, imp, why)] = d.near_misses([mine, theirs], CFG)
+        self.assertTrue(any("different account" in w for w in why))
+        self.assertTrue(any("days apart" in w for w in why))
+
+    def test_reports_split_bank_copy(self):
+        mine = tx("10", "2026-10-01", "A")
+        [(_, _, why)] = d.near_misses([mine, bank("10", "2026-10-01", "A", split_parent_id=3)], CFG)
+        self.assertEqual(why, ["bank copy is split"])
+
+    def test_real_match_is_not_a_near_miss(self):
+        self.assertEqual(d.near_misses([tx("10", "2026-10-01", "A"),
+                                        bank("10", "2026-10-02", "A")], CFG), [])
 
 
 class TestConfig(unittest.TestCase):

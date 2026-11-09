@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0 (2026-11-04)
+
+- New `explain` command: shows how many of your entries and bank copies are on each account, and lists entries that have a same-amount bank transaction within a month but weren't matched, with the reason (different account, too many days apart, bank copy pending or split, currency, refund vs charge).
+
 ## 1.0.0 (2026-11-04)
 
 - First release.
